@@ -1,0 +1,4 @@
+{
+    "weekdays": ["Niedziela", "Poniedziałek", "Wtorek", "Środa", "Czwartek", "Piątek", "Sobota"],
+    "amPm": ["AM", "PM"]
+}

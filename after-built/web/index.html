@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Flying Clock Screensaver</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0a0a0a;
+    overflow: hidden;
+    font-family: 'Segoe UI', sans-serif;
+  }
+
+  #date {
+    position: fixed;
+    bottom: 5%;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 22px;
+    letter-spacing: 2px;
+    text-align: center;
+    pointer-events: none;
+    z-index: 1;
+    white-space: nowrap;
+  }
+
+  #clock-canvas {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  .author-label {
+    position: fixed;
+    color: rgba(255, 255, 255, 0.85);
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 14px;
+    letter-spacing: 1px;
+    opacity: 0;
+    transition: opacity 0.6s ease;
+    pointer-events: none;
+    z-index: 10;
+    text-shadow: 0 0 8px rgba(0, 0, 0, 0.6);
+  }
+  .author-label.visible { opacity: 1; }
+  #author-tl { top: 20px; left: 20px; }
+  #author-tr { top: 20px; right: 20px; }
+  #author-bl { bottom: 20px; left: 20px; }
+  #author-br { bottom: 20px; right: 20px; }
+</style>
+
+<!-- Bare "three" specifier used by the vendored addon modules below resolves
+     through this import map — same technique the main portfolio site uses. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.min.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="date"></div>
+<canvas id="clock-canvas"></canvas>
+<div id="author-tl" class="author-label">Andrzej Kamiński</div>
+<div id="author-tr" class="author-label">rekin123p</div>
+<div id="author-bl" class="author-label">rek123p</div>
+<div id="author-br" class="author-label">[-Bravo-]</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { FontLoader } from './vendor/FontLoader.js';
+
+// ====== Config + i18n (language + 12h/24h) ======
+// config.json:          { "language": "en", "timeFormat": "24" }
+// i18n/languages.json:  manifest of available language codes -> display names
+// i18n/<code>.json:     { "weekdays": [...7 names, Sunday-first...], "amPm": ["AM","PM"] }
+//
+// To add a new language later: drop a new i18n/<code>.json with those same two
+// keys, then add its entry to i18n/languages.json. No other file needs to change.
+const DEFAULT_LANG = 'en';
+const FALLBACK_WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const FALLBACK_AMPM = ['AM', 'PM'];
+
+let activeWeekdays = FALLBACK_WEEKDAYS;
+let activeAmPm = FALLBACK_AMPM;
+let timeFormat = '24';
+
+async function loadJson(path, fallback) {
+  try {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } catch (err) {
+    console.warn('Failed to load ' + path + ', using fallback.', err);
+    return fallback;
+  }
+}
+
+async function loadConfig() {
+  const config = await loadJson('config.json', { language: DEFAULT_LANG, timeFormat: '24' });
+  timeFormat = (config.timeFormat === '12') ? '12' : '24';
+
+  const languages = await loadJson('i18n/languages.json', { [DEFAULT_LANG]: 'English' });
+  const lang = (config.language && languages[config.language]) ? config.language : DEFAULT_LANG;
+
+  const langData = await loadJson('i18n/' + lang + '.json', null);
+  if (langData && Array.isArray(langData.weekdays) && langData.weekdays.length === 7) {
+    activeWeekdays = langData.weekdays;
+    activeAmPm = (Array.isArray(langData.amPm) && langData.amPm.length === 2) ? langData.amPm : FALLBACK_AMPM;
+  }
+}
+
+// ====== Time + date ======
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function formatTime(now) {
+  let hours = now.getHours();
+  const minutes = pad2(now.getMinutes());
+
+  if (timeFormat === '12') {
+    const suffix = hours >= 12 ? activeAmPm[1] : activeAmPm[0];
+    hours = hours % 12;
+    if (hours === 0) hours = 12;
+    return pad2(hours) + ':' + minutes + ' ' + suffix;
+  }
+
+  return pad2(hours) + ':' + minutes;
+}
+
+function currentDateString(now) {
+  // Date stays one universal DD.MM.YYYY format regardless of language for now
+  // (easy to make locale-specific per language file later if wanted).
+  const dateStr = pad2(now.getDate()) + '.' + pad2(now.getMonth() + 1) + '.' + now.getFullYear();
+  return dateStr + ' · ' + activeWeekdays[now.getDay()];
+}
+
+const dateEl = document.getElementById('date');
+
+// ====== 3D clock (Three.js extruded text) ======
+// This mirrors the original logo's own 3D technique, not just its material:
+// a real PerspectiveCamera (not orthographic). clockGroup itself is never
+// rotated — it does not spin, and has no fixed tilt either — so at the
+// exact center of the screen it's viewed perfectly straight-on. Moving away
+// from center is what puts it at an angle: a true perspective camera views
+// off-axis positions from an angle, the center head-on. That's the
+// "dynamic perspective": it comes entirely from the camera and the
+// object's current position as it bounces around, never from rotating the
+// object itself.
+const canvas = document.getElementById('clock-canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+const scene = new THREE.Scene();
+
+const FOV_DEG = 35;
+let viewW = window.innerWidth;
+let viewH = window.innerHeight;
+const camera = new THREE.PerspectiveCamera(FOV_DEG, viewW / viewH, 0.1, 5000);
+camera.position.set(0, 0, 0); // z distance is calibrated in handleResize()
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
+keyLight.position.set(150, 200, 300);
+scene.add(keyLight);
+const rimLight = new THREE.DirectionalLight(0xfff2cc, 0.5);
+rimLight.position.set(-200, -70, -250);
+scene.add(rimLight);
+const fillLight = new THREE.PointLight(0xffffff, 0.3);
+fillLight.position.set(-150, 100, 300);
+scene.add(fillLight);
+
+const clockMaterial = new THREE.MeshStandardMaterial({
+  color: 0xf2f2f2,
+  roughness: 0.45,
+  metalness: 0.25,
+  // Double-sided is a defensive leftover from when this clock spun
+  // continuously and needed both faces lit to stay legible through the
+  // turn. clockGroup no longer rotates, so front faces should always face
+  // the camera anyway, but this costs nothing to keep and guards against
+  // extrusion winding-order surprises (or a future rotation coming back).
+  side: THREE.DoubleSide
+});
+
+const TEXT_SIZE = 120;
+const TEXT_DEPTH = TEXT_SIZE * 0.28;
+
+let font = null;
+let clockGroup = new THREE.Group();
+// No rotation is ever applied to clockGroup (see the comment above) — it
+// keeps Three.js's default identity rotation for its entire lifetime.
+scene.add(clockGroup);
+
+let lastRenderedText = null;
+// The 8 corners of the mesh's local bounding box (set below, centered on
+// the group's own origin). Re-projected through the camera every frame so
+// the bounce/hitbox code always uses the REAL, current on-screen shape
+// instead of a fixed flat size.
+let localCorners = null;
+
+function rebuildClockMesh(text) {
+  if (!font) return;
+  if (text === lastRenderedText) return;
+  lastRenderedText = text;
+
+  while (clockGroup.children.length > 0) {
+    const child = clockGroup.children.pop();
+    child.geometry.dispose();
+  }
+
+  // One mesh per character — the same technique the original logo uses
+  // (a separate Mesh per shape/letter via ExtrudeGeometry, not one fused
+  // string). Each character sits at its own position, so the extrusion
+  // depth reads as real per-character depth under the perspective camera,
+  // instead of one flat slab.
+  const scale = TEXT_SIZE / font.data.resolution;
+  let advanceX = 0;
+  const built = []; // { mesh, geometry } for every character just added
+  for (const ch of Array.from(text)) {
+    const glyph = font.data.glyphs[ch] || font.data.glyphs['?'];
+    const charShapes = font.generateShapes(ch, TEXT_SIZE);
+    if (charShapes.length > 0) {
+      const geometry = new THREE.ExtrudeGeometry(charShapes, {
+        depth: TEXT_DEPTH,
+        bevelEnabled: false,
+        curveSegments: 12
+      });
+      geometry.computeVertexNormals();
+      geometry.computeBoundingBox(); // LOCAL box, in the geometry's own untransformed space
+      const mesh = new THREE.Mesh(geometry, clockMaterial);
+      mesh.position.x = advanceX;
+      clockGroup.add(mesh);
+      built.push({ mesh, geometry });
+    }
+    advanceX += (glyph ? glyph.ha : TEXT_SIZE * 0.5) * scale;
+  }
+
+  // Re-center the whole group on its combined bounding box — same as the
+  // original centering its logo group on its own bounding-box center —
+  // so clockGroup.position represents its actual visual center rather than
+  // an arbitrary corner.
+  //
+  // Deliberately NOT THREE.Box3().setFromObject(clockGroup): that computes
+  // a WORLD-space box (it bakes in clockGroup's CURRENT position/rotation
+  // via matrixWorld), but the result was then subtracted from each mesh's
+  // LOCAL position below — a space mismatch. Since clockGroup's world
+  // position drifts as it bounces around the screen, that made the
+  // recentering more wrong the further from the world origin the clock
+  // currently was, and every rebuild (i.e. every time the displayed minute
+  // changes) snapped the whole thing toward world origin — screen center.
+  // Building the box from each geometry's own local bounding box + that
+  // mesh's local position instead never touches clockGroup's world
+  // transform at all, so this can't happen.
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  for (const { mesh, geometry } of built) {
+    const gbox = geometry.boundingBox;
+    min.x = Math.min(min.x, gbox.min.x + mesh.position.x);
+    min.y = Math.min(min.y, gbox.min.y + mesh.position.y);
+    min.z = Math.min(min.z, gbox.min.z + mesh.position.z);
+    max.x = Math.max(max.x, gbox.max.x + mesh.position.x);
+    max.y = Math.max(max.y, gbox.max.y + mesh.position.y);
+    max.z = Math.max(max.z, gbox.max.z + mesh.position.z);
+  }
+  const center = new THREE.Vector3(
+    (min.x + max.x) / 2,
+    (min.y + max.y) / 2,
+    (min.z + max.z) / 2
+  );
+  clockGroup.children.forEach((mesh) => {
+    mesh.position.x -= center.x;
+    mesh.position.y -= center.y;
+    mesh.position.z -= center.z;
+  });
+
+  // Store all 8 corners of the (now centered) local bounding box. This is
+  // what lets the bounce/hitbox code project the object's true on-screen
+  // silhouette every frame instead of assuming a fixed flat rectangle.
+  const cmin = min.clone().sub(center);
+  const cmax = max.clone().sub(center);
+  localCorners = [
+    new THREE.Vector3(cmin.x, cmin.y, cmin.z), new THREE.Vector3(cmax.x, cmin.y, cmin.z),
+    new THREE.Vector3(cmin.x, cmax.y, cmin.z), new THREE.Vector3(cmax.x, cmax.y, cmin.z),
+    new THREE.Vector3(cmin.x, cmin.y, cmax.z), new THREE.Vector3(cmax.x, cmin.y, cmax.z),
+    new THREE.Vector3(cmin.x, cmax.y, cmax.z), new THREE.Vector3(cmax.x, cmax.y, cmax.z)
+  ];
+}
+
+function updateTimeAndDate() {
+  const now = new Date();
+  rebuildClockMesh(formatTime(now));
+  dateEl.textContent = currentDateString(now);
+}
+
+// ====== DVD-style bounce (screen position) + corner author hitboxes ======
+// centerX/centerY track the clock's CENTER in plain top-down CSS-pixel
+// space. clockGroup never rotates, but its on-screen size/shape still
+// isn't perfectly constant: a true perspective camera renders the same
+// unrotated object a little differently depending on where in the frustum
+// it currently sits (center vs. near an edge). So instead of bouncing a
+// remembered flat size, every frame projectScreenRect() runs the object's
+// actual 3D bounding box through the camera at its CURRENT position to get
+// the real on-screen rectangle, and that rectangle — not a fixed size — is
+// what the wall bounce AND the corner-hitbox overlap check both use.
+// That's what keeps the visible object and the collision box in agreement.
+let centerX = 0, centerY = 0;
+let velX = 2.6, velY = 1.9; // px/frame, same "felt speed" as the original
+
+// Reusable scratch objects so projectScreenRect() doesn't allocate every frame.
+const _matrix = new THREE.Matrix4();
+const _quat = new THREE.Quaternion();
+const _euler = new THREE.Euler();
+const _scale = new THREE.Vector3(1, 1, 1);
+const _worldPos = new THREE.Vector3();
+const _corner = new THREE.Vector3();
+
+function pixelCenterToWorld(cx, cy) {
+  // camera.position.z is calibrated (in handleResize) so the visible
+  // frustum at z=0 spans exactly viewW x viewH world units, centered on
+  // (0,0) instead of CSS's top-left origin — that's the only place plain
+  // pixel space and world space are tied together; everything else here
+  // (including the actual on-screen size) comes from real camera projection.
+  return { x: cx - viewW / 2, y: viewH / 2 - cy };
+}
+
+// Projects the object's local bounding-box corners through a candidate
+// center position and the real camera, returning the actual on-screen
+// rectangle (CSS pixels) that position would occupy. Still reads
+// clockGroup.rotation (currently always zero, since nothing sets it) so
+// this keeps working unchanged if a rotation is ever reintroduced.
+function projectScreenRect(cx, cy) {
+  const worldCenter = pixelCenterToWorld(cx, cy);
+  _euler.set(clockGroup.rotation.x, clockGroup.rotation.y, 0);
+  _quat.setFromEuler(_euler);
+  _worldPos.set(worldCenter.x, worldCenter.y, 0);
+  _matrix.compose(_worldPos, _quat, _scale);
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const localCorner of localCorners) {
+    _corner.copy(localCorner).applyMatrix4(_matrix).project(camera);
+    const sx = (_corner.x * 0.5 + 0.5) * viewW;
+    const sy = (1 - (_corner.y * 0.5 + 0.5)) * viewH;
+    if (sx < minX) minX = sx;
+    if (sx > maxX) maxX = sx;
+    if (sy < minY) minY = sy;
+    if (sy > maxY) maxY = sy;
+  }
+  return { left: minX, top: minY, right: maxX, bottom: maxY };
+}
+
+// The most recently projected rectangle. Used both to size the NEXT
+// bounce step (one frame stale — ~33ms — which is not perceptible, and
+// avoids needing this frame's position before this frame's size is known)
+// and, right after this frame's step, as the real hitbox for the
+// corner-author overlap check.
+let lastRect = { left: 0, top: 0, right: 0, bottom: 0 };
+
+function initPosition() {
+  const rect = projectScreenRect(viewW / 2, viewH / 2);
+  const halfW = (rect.right - rect.left) / 2;
+  const halfH = (rect.bottom - rect.top) / 2;
+  centerX = halfW + Math.random() * Math.max(1, viewW - halfW * 2);
+  centerY = halfH + Math.random() * Math.max(1, viewH - halfH * 2);
+  lastRect = projectScreenRect(centerX, centerY);
+  const worldCenter = pixelCenterToWorld(centerX, centerY);
+  clockGroup.position.set(worldCenter.x, worldCenter.y, 0);
+}
+
+const corners = [
+  { id: 'author-tl', el: document.getElementById('author-tl'), wasOverlapping: false, timerId: null },
+  { id: 'author-tr', el: document.getElementById('author-tr'), wasOverlapping: false, timerId: null },
+  { id: 'author-bl', el: document.getElementById('author-bl'), wasOverlapping: false, timerId: null },
+  { id: 'author-br', el: document.getElementById('author-br'), wasOverlapping: false, timerId: null }
+];
+
+// Each corner's hitbox is a square sized from that corner's OWN label text,
+// not a big fixed region — a square just a bit bigger than the label, with
+// the same buffer beyond the label as the label already keeps from the
+// screen edge (20px, matching the .author-label CSS top/left/right/bottom
+// offsets above). Measured once: the label's size and its 20px offset are
+// both fixed by CSS, so this never needs to be recomputed.
+const CORNER_EDGE_GAP = 20; // matches .author-label's CSS offset from the screen edge
+const cornerSizes = {};
+for (const corner of corners) {
+  const r = corner.el.getBoundingClientRect();
+  cornerSizes[corner.id] = Math.max(r.width, r.height) + CORNER_EDGE_GAP * 2;
+}
+
+function cornerRect(id) {
+  const w = viewW, h = viewH;
+  const size = cornerSizes[id];
+  if (id === 'author-tl') return { left: 0, top: 0, right: size, bottom: size };
+  if (id === 'author-tr') return { left: w - size, top: 0, right: w, bottom: size };
+  if (id === 'author-bl') return { left: 0, top: h - size, right: size, bottom: h };
+  return { left: w - size, top: h - size, right: w, bottom: h }; // author-br
+}
+
+// Whether the clock has reached a corner: a plain rectangle overlap test.
+// This used to be too easy to trigger because the corner zone (CORNER_SIZE)
+// was a big fixed 220x220 region, much bigger than the actual label text,
+// so the clock's bounding box could graze that huge empty margin long
+// before (or without) ever visually touching the label. Now that
+// cornerRect() itself is sized tightly to each label (see above), a plain
+// overlap is the right test again: the box IS the label's own footprint
+// plus a small matching buffer, so any overlap means the clock has
+// genuinely gotten close to the readable text, not just grazed empty space.
+// (A "clock rect center inside the corner box" test was tried instead, but
+// at extreme near-corner angles perspective skew can shift the projected
+// rect's own geometric center away from the corner even while the clock
+// visibly covers the label — with a box this small, that made the check
+// almost impossible to satisfy at all.)
+function clockReachedCorner(rect, corner) {
+  return rect.left < corner.right && rect.right > corner.left &&
+         rect.top < corner.bottom && rect.bottom > corner.top;
+}
+
+function showCorner(corner) {
+  if (corner.timerId) clearTimeout(corner.timerId);
+  corner.el.classList.add('visible');
+  corner.timerId = setTimeout(() => {
+    corner.el.classList.remove('visible');
+    corner.timerId = null;
+  }, 5000);
+}
+
+function updateBounce() {
+  // clockGroup.rotation is never set at all — it stays at its default
+  // identity value for the object's entire lifetime.
+  centerX += velX;
+  centerY += velY;
+
+  let rect = projectScreenRect(centerX, centerY);
+
+  if (rect.left <= 0 || rect.right >= viewW) {
+    velX *= -1;
+    if (rect.left <= 0) centerX += -rect.left;
+    else centerX -= (rect.right - viewW);
+    rect = projectScreenRect(centerX, centerY);
+  }
+  if (rect.top <= 0 || rect.bottom >= viewH) {
+    velY *= -1;
+    if (rect.top <= 0) centerY += -rect.top;
+    else centerY -= (rect.bottom - viewH);
+    rect = projectScreenRect(centerX, centerY);
+  }
+
+  const worldCenter = pixelCenterToWorld(centerX, centerY);
+  clockGroup.position.set(worldCenter.x, worldCenter.y, 0);
+
+  // This is the object's REAL on-screen rectangle for this exact frame —
+  // the fix for hitboxes that used to assume a fixed, never-rotated size.
+  lastRect = rect;
+  for (const corner of corners) {
+    const isOverlapping = clockReachedCorner(lastRect, cornerRect(corner.id));
+    if (corner.wasOverlapping && !isOverlapping) {
+      showCorner(corner);
+    }
+    corner.wasOverlapping = isOverlapping;
+  }
+}
+
+function handleResize() {
+  viewW = window.innerWidth;
+  viewH = window.innerHeight;
+  camera.aspect = viewW / viewH;
+  // Recalibrate distance so the frustum at z=0 still spans exactly
+  // viewW x viewH world units — see pixelCenterToWorld() above.
+  const fovRad = FOV_DEG * Math.PI / 180;
+  camera.position.z = viewH / (2 * Math.tan(fovRad / 2));
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld(true); // so projectScreenRect() can use it immediately, before the first render()
+  renderer.setSize(viewW, viewH, false);
+  const halfW = (lastRect.right - lastRect.left) / 2;
+  const halfH = (lastRect.bottom - lastRect.top) / 2;
+  centerX = Math.min(Math.max(centerX, halfW), viewW - halfW);
+  centerY = Math.min(Math.max(centerY, halfH), viewH - halfH);
+}
+
+window.addEventListener('resize', handleResize);
+
+// Capped render loop (~30fps) — an unthrottled WebGL loop running for hours
+// on end-user hardware as a screensaver is exactly the kind of thing worth
+// avoiding, even though this app owns the whole screen either way.
+const FRAME_INTERVAL_MS = 1000 / 30;
+let lastFrameAt = 0;
+
+function renderLoop(now) {
+  requestAnimationFrame(renderLoop);
+  if (now - lastFrameAt < FRAME_INTERVAL_MS) return;
+  lastFrameAt = now;
+  updateBounce();
+  renderer.render(scene, camera);
+}
+
+(async function start() {
+  handleResize();
+  await loadConfig();
+
+  const loader = new FontLoader();
+  font = await new Promise((resolve, reject) => {
+    loader.load('fonts/helvetiker_bold.typeface.json', resolve, undefined, reject);
+  });
+
+  updateTimeAndDate();
+  setInterval(updateTimeAndDate, 1000);
+
+  initPosition();
+  requestAnimationFrame(renderLoop);
+})();
+</script>
+</body>
+</html>
