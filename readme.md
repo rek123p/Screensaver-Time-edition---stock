@@ -5,7 +5,6 @@ Three.js) that bounces DVD-logo style across every connected monitor, with
 a hidden author signature quietly revealing itself in whichever corner it
 last bounced off of.
 
-<<<<<<< HEAD:README.md
 ## Features
 
 - A real 3D clock, not a flat image - per-character extruded text rendered
@@ -49,8 +48,3 @@ for details). The real fullscreen screensaver is unaffected.
 [PolyForm Noncommercial 1.0.0](LICENSE) - free to use, modify, and
 redistribute for any noncommercial purpose. Commercial use (including
 selling it, or a modified version of it) is not permitted.
-=======
-- [`pre-built/`](pre-built/readme.md) - raw source code, build instructions.
-- [`after-built/`](after-built/install.md) - ready-to-install build,
-  installation instructions.
->>>>>>> ace5dd0385b795c1d9cf17d2b1d8dca9e790e696:readme.md
